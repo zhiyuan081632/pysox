@@ -648,10 +648,25 @@ def wav_mix_to_mono(in_path: str, out_path: str, method: str = 'average') -> Non
 
 
 def parse_offset_time_to_seconds(offset_time_str):
-    """将时:分:秒.毫秒格式的字符串转换为秒（浮点数）"""
-    hours, minutes, rest = offset_time_str.split(':')
-    seconds, milliseconds = map(float, rest.split('.'))
-    total_seconds = int(hours) * 3600 + int(minutes) * 60 + seconds + milliseconds / 1000
+    """将时:分:秒[.毫秒]格式的字符串转换为秒（浮点数）
+    
+    支持 'HH:MM:SS.mmm'、'HH:MM:SS'、'MM:SS'、'SS' 等写法，毫秒部分可省略
+    """
+    parts = offset_time_str.split(':')
+    if len(parts) == 3:
+        hours, minutes, rest = parts
+    elif len(parts) == 2:
+        hours, minutes, rest = '0', parts[0], parts[1]
+    else:
+        hours, minutes, rest = '0', '0', parts[0]
+    if '.' in rest:
+        seconds_s, frac = rest.split('.')
+        seconds = float(seconds_s)
+        milliseconds = float('0.' + frac)  # 小数部分按十进制秒处理，'.5' 与 '.500' 均为半秒
+    else:
+        seconds = float(rest)
+        milliseconds = 0.0
+    total_seconds = int(hours) * 3600 + int(minutes) * 60 + seconds + milliseconds
     return total_seconds
 
 def format_seconds_to_hms(seconds):
@@ -877,7 +892,6 @@ def video_time_cut(in_path, out_path, start_time='00:00:00.000', end_time=None):
     """
     print('Video time cut')
     filenames = get_filenames(in_path)
-    
     start_s = parse_offset_time_to_seconds(start_time)
     end_s = parse_offset_time_to_seconds(end_time) if end_time else None
 
@@ -930,6 +944,66 @@ def video_time_cut(in_path, out_path, start_time='00:00:00.000', end_time=None):
             print(f'  FFmpeg error: {e}')
 
 
+# 将视频文件按时间间隔进行切分，时长单位为秒
+def video_interval_cut(in_path, out_path, interv_seconds=60):
+    print('Video interval cut')
+    filenames = get_filenames(in_path)
+    interv_seconds = float(interv_seconds)
+
+    for video_file in filenames:
+        _, ext = os.path.splitext(video_file)
+        if ext.lower() not in ['.mp4', '.mkv', '.avi', '.mov']:
+            continue
+
+        print(f'\nProcessing: {video_file}')
+
+        # 用 ffprobe 获取视频总时长
+        try:
+            duration_s = float(subprocess.check_output([
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                video_file
+            ]).decode('utf-8').strip())
+        except subprocess.CalledProcessError as e:
+            print(f'  ffprobe error: {e}')
+            continue
+        print(f'duration: {duration_s:.2f}s')
+        print(f'interv seconds: {interv_seconds:.0f}s')
+
+        # 计算切分段数
+        total_segments = int(duration_s // interv_seconds) + (1 if duration_s % interv_seconds > 0 else 0)
+        print(f'total segments: {total_segments}')
+
+        in_name = os.path.basename(video_file)
+        name_no_ext = os.path.splitext(in_name)[0]
+
+        for cnt in range(total_segments):
+            start_s = cnt * interv_seconds
+            end_s = min(start_s + interv_seconds, duration_s)
+            out_file_name = f'{name_no_ext}_{interv_seconds:.0f}s_{cnt}{ext}'
+            out_file = os.path.join(out_path, out_file_name)
+
+            # -ss 放在 -i 前实现快速定位，视频重编码保证精确切分
+            cmd = [
+                'ffmpeg', '-y',
+                '-ss', str(start_s),
+                '-i', video_file,
+                '-t', str(end_s - start_s),
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                out_file
+            ]
+
+            print(f'out: {cnt+1}/{total_segments}:\t{out_file}')
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as e:
+                print(f'  FFmpeg error: {e}')
+
+
 # 将原始音频根据时长进行切分，时长单位为秒
 def wav_cut(in_file, interv_seconds=60):
     _, in_type = os.path.splitext(in_file)
@@ -960,7 +1034,7 @@ def wav_cut(in_file, interv_seconds=60):
         
         while(time_start_ms < duration_ms):
             time_end_ms = min(time_start_ms + interv_seconds * 1000, duration_ms)
-            out_file_name = in_name.replace(in_type, ('_' + str(interv_seconds) + 's' + '_' + str(cnt) + '.wav'))
+            out_file_name = in_name.replace(in_type, ('_' + str(int(interv_seconds)) + 's' + '_' + str(cnt) + '.wav'))
             # wav_out_name = os.path.join(out_path, out_file_name)
             
             relative_path = os.path.dirname(os.path.relpath(in_file, in_path))
@@ -975,15 +1049,17 @@ def wav_cut(in_file, interv_seconds=60):
             segment = wav_in[time_start_ms:time_end_ms]
             segment.export(out_file_path, format="wav")
             
-            time_end_ms = time_end_ms
+            time_start_ms = time_end_ms  # 推进切分起点，否则死循环重复切第 0 段
             cnt += 1
 
 def wav_interval_cut(in_path, out_path, interv_seconds=60.0):
-    print('Convert other format to wav')
+    print('Audio interval cut')
     filenames = get_filenames(in_path)
+    interv_seconds = float(interv_seconds)
 
     with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-        pool.map(wav_cut, filenames)
+        # 必须把 interv_seconds 传给 wav_cut，否则永远按默认 60s 切分
+        pool.starmap(wav_cut, [(f, interv_seconds) for f in filenames])
 
 
 # 计算音频时长，并写入到文件中 
@@ -1120,7 +1196,8 @@ if __name__ == '__main__':
         resample    ----    转换采样率
         textgridcut ----    按标注文件TextGrid切分音频
         videotextgridcut ---- 按TextGrid切分MP4视频
-        videocut    ----    按时间段切分MP4视频
+        videocut    ----    按时间间隔切分MP4视频
+        videotimecut ----   按时间段(start_time~end_time)切分MP4视频
         textcut     ----    按标注文件Text切分音频
         intervcut   ----    按时间间隔切分音频
         merge       ----    多个单通道文件合并成多通道
@@ -1221,6 +1298,8 @@ if __name__ == '__main__':
     elif (func == 'videotextgridcut'):
         video_textgrid_cut(in_path, out_path, args.textgrid_file, args.textgrid_start)
     elif (func == 'videocut'):
+        video_interval_cut(in_path, out_path, args.interv_s)
+    elif (func == 'videotimecut'):
         video_time_cut(in_path, out_path, args.start_time, args.end_time)
     elif (func == 'intervcut'):
         wav_interval_cut(in_path, out_path, args.interv_s)
